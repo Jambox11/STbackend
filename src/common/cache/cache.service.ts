@@ -1,113 +1,93 @@
-// cache.service.ts — issue #92: Redis-backed API response caching
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import Redis from 'ioredis';
+import { Cache } from 'cache-manager';
 
-const DEFAULT_TTL_SECONDS = 60;
+const DEFAULT_INVALIDATE_MAX_KEYS = 10_000;
+const SCAN_BATCH_SIZE = 100;
+
+export interface InvalidateNamespaceOptions {
+  maxKeys?: number;
+}
 
 @Injectable()
-export class CacheService implements OnModuleDestroy {
+export class CacheService {
   private readonly logger = new Logger(CacheService.name);
-  private readonly redis: Redis;
-  private readonly defaultTtlSeconds: number;
 
-  private hits = 0;
-  private misses = 0;
+  constructor(
+    private readonly cache: Cache,
+    private readonly configService: ConfigService,
+  ) {}
 
-  constructor(private readonly config: ConfigService) {
-    const redisUrl = this.config.get<string>('REDIS_URL');
-    this.redis = redisUrl
-      ? new Redis(redisUrl, { lazyConnect: false, maxRetriesPerRequest: 2 })
-      : new Redis({
-          host: this.config.get<string>('REDIS_HOST', 'localhost'),
-          port: this.config.get<number>('REDIS_PORT', 6379),
-          password: this.config.get<string>('REDIS_PASSWORD') || undefined,
-          maxRetriesPerRequest: 2,
-        });
-
-    this.redis.on('error', (err) => {
-      this.logger.warn(`Redis connection error: ${err.message}`);
-    });
-
-    this.defaultTtlSeconds = this.config.get<number>('CACHE_TTL_SECONDS', DEFAULT_TTL_SECONDS);
+  async get<T>(key: string): Promise<T | undefined> {
+    return this.cache.get<T>(key);
   }
 
-  async onModuleDestroy() {
-    await this.redis.quit().catch(() => undefined);
-  }
-
-  /**
-   * Deterministic cache key from a namespace and a set of query params.
-   * Params are sorted so equivalent queries in a different order share a key.
-   */
-  buildKey(namespace: string, params: Record<string, unknown> = {}): string {
-    const sortedEntries = Object.keys(params)
-      .filter((k) => params[k] !== undefined && params[k] !== null && params[k] !== '')
-      .sort()
-      .map((k) => `${k}=${String(params[k])}`);
-    return `cache:${namespace}${sortedEntries.length ? ':' + sortedEntries.join('&') : ''}`;
-  }
-
-  /**
-   * Round-trip Redis PING used by the aggregate /health check (issue #170).
-   * Rejects when the connection is down so the health aggregation fails the
-   * readiness probe. Returns the round-trip time in milliseconds.
-   */
-  async ping(): Promise<number> {
-    const startedAt = Date.now();
-    await this.redis.ping();
-    return Date.now() - startedAt;
-  }
-
-  async get<T = unknown>(key: string): Promise<T | null> {
-    try {
-      const raw = await this.redis.get(key);
-      if (raw === null) {
-        this.misses += 1;
-        return null;
-      }
-      this.hits += 1;
-      return JSON.parse(raw) as T;
-    } catch (err) {
-      this.logger.warn(`Cache read failed for "${key}": ${(err as Error).message}`);
-      this.misses += 1;
-      return null;
-    }
-  }
-
-  async set(key: string, value: unknown, ttlSeconds: number = this.defaultTtlSeconds): Promise<void> {
-    try {
-      await this.redis.set(key, JSON.stringify(value), 'EX', ttlSeconds);
-    } catch (err) {
-      this.logger.warn(`Cache write failed for "${key}": ${(err as Error).message}`);
-    }
+  async set(key: string, value: unknown, ttlMs?: number): Promise<void> {
+    await this.cache.set(key, value, ttlMs);
   }
 
   async del(key: string): Promise<void> {
-    await this.redis.del(key).catch(() => undefined);
+    await this.cache.del(key);
   }
 
-  /** Invalidates every cached entry under a namespace, e.g. on content updates. */
-  async invalidateNamespace(namespace: string): Promise<void> {
-    const pattern = `cache:${namespace}*`;
-    try {
-      let cursor = '0';
-      do {
-        const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-        cursor = nextCursor;
-        if (keys.length) await this.redis.del(...keys);
-      } while (cursor !== '0');
-    } catch (err) {
-      this.logger.warn(`Cache invalidation failed for namespace "${namespace}": ${(err as Error).message}`);
+  private resolveMaxKeys(options?: InvalidateNamespaceOptions): number {
+    if (options?.maxKeys !== undefined) {
+      return options.maxKeys;
     }
+    const configured = this.configService?.get<string | number>(
+      'CACHE_INVALIDATE_MAX_KEYS',
+    );
+    const parsed = Number(configured);
+    return Number.isFinite(parsed) && parsed > 0
+      ? parsed
+      : DEFAULT_INVALIDATE_MAX_KEYS;
   }
 
-  getStats() {
-    const total = this.hits + this.misses;
-    return {
-      hits: this.hits,
-      misses: this.misses,
-      hitRate: total > 0 ? this.hits / total : 0,
-    };
+  async invalidateNamespace(
+    namespace: string,
+    options?: InvalidateNamespaceOptions,
+  ): Promise<number> {
+    const maxKeys = this.resolveMaxKeys(options);
+    const pattern = `${namespace}:*`;
+    let deleted = 0;
+    let cursor = '0';
+
+    try {
+      do {
+        const [nextCursor, keys] = await this.cache.store.scan(
+          cursor,
+          'MATCH',
+          pattern,
+          'COUNT',
+          SCAN_BATCH_SIZE,
+        );
+        cursor = nextCursor;
+
+        if (keys.length > 0) {
+          const remaining = maxKeys - deleted;
+          const batch = keys.slice(0, remaining);
+          if (batch.length > 0) {
+            await this.cache.store.del(...batch);
+            deleted += batch.length;
+          }
+        }
+
+        if (deleted >= maxKeys) {
+          this.logger.warn(
+            `invalidateNamespace(${namespace}) reached maxKeys cap (${maxKeys}); deleted ${deleted} keys, namespace may be partially invalidated`,
+          );
+          break;
+        }
+      } while (cursor !== '0');
+    } catch (error) {
+      this.logger.warn(
+        `invalidateNamespace(${namespace}) failed after deleting ${deleted} keys: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      throw error;
+    }
+
+    return deleted;
   }
 }
