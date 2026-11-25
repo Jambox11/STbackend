@@ -47,6 +47,15 @@ export interface QueueJobStatus {
   failedReason?: string;
 }
 
+/**
+ * Snapshot of a queue's job counts and derived metrics.
+ *
+ * - `total` is the sum of all counted states:
+ *   `active + waiting + delayed + completed + failed + paused`.
+ * - `failureRate` is `failed / (completed + failed)`, i.e. the share of
+ *   finished jobs that failed. It is `0` when there are no finished jobs
+ *   (`completed + failed === 0`).
+ */
 export interface QueueMetrics {
   queue: string;
   active: number;
@@ -210,6 +219,7 @@ export class QueueService {
     const failed = counts.failed ?? 0;
     const paused = counts.paused ?? 0;
     const total = active + waiting + delayed + completed + failed + paused;
+    const finished = completed + failed;
 
     return {
       queue: queue.name,
@@ -220,7 +230,7 @@ export class QueueService {
       failed,
       paused,
       total,
-      failureRate: total > 0 ? failed / total : 0,
+      failureRate: finished > 0 ? failed / finished : 0,
     };
   }
 }
